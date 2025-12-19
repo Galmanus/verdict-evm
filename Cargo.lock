@@ -711,6 +711,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenv"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3623,14 +3629,14 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "verdict"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "dotenv",
  "ethers",
  "hex",
- "rand 0.8.5",
  "serde",
  "serde_json",
  "sha3",

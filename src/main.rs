@@ -1,6 +1,22 @@
 
+// VERDICT v1.0.0 - Community Edition - Advanced EVM Honeypot Detector
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 use clap::Parser;
-use colored::*;
+use colored::Colorize;
+use dotenv::dotenv;
 use ethers::{
     abi::Token,
     contract::BaseContract,
@@ -16,6 +32,7 @@ use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use tracing::{info, warn, error};
 use tokio::time::{timeout, Duration};
+use anyhow::Result;
 
 // Define state override structures
 #[derive(Serialize, Deserialize)]
@@ -77,32 +94,38 @@ fn is_special_token(token_addr: H160) -> bool {
     }
 }
 
-
-
-
-
-fn parse_error(revert_msg: &str) -> String {
-    let lower = revert_msg.to_lowercase();
-    
-    // Enhanced honeypot detection patterns
-    if lower.contains("transfer amount exceeds balance") || lower.contains("insufficient balance") || lower.contains("balance too low") {
-        "[HONEYPOT] Cannot Sell".to_string()
-    } else if lower.contains("paused") || lower.contains("pause") {
-        "[HONEYPOT] Paused".to_string()
-    } else if lower.contains("approve") || lower.contains("allowance") {
-        "[HONEYPOT] Approval Failed".to_string()
-    } else if lower.contains("revert") {
-        format!("[HONEYPOT] Execution Reverted: {}", revert_msg)
-    } else if lower.contains("out of gas") {
-        "[HONEYPOT] Out of Gas".to_string()
-    } else if lower.contains("stack underflow") || lower.contains("stack overflow") {
-        "[HONEYPOT] Stack Error".to_string()
-    } else if lower.contains("execution reverted") {
-        format!("[HONEYPOT] Reverted: {}", revert_msg)
-    } else {
-        format!("Execution reverted: {}", revert_msg)
+fn get_verified_asset_info(addr: H160, chain_id: u64) -> Option<&'static str> {
+    if chain_id != 1 {
+        return None;
+    }
+    let addr_str = format!("{:?}", addr).to_lowercase();
+    match addr_str.as_str() {
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => Some("Tether USD (USDT)"),
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => Some("USD Coin (USDC)"),
+        "0x6b175474e89094c44da98b954eedeac495271d0f" => Some("Dai Stablecoin (DAI)"),
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => Some("Wrapped BTC (WBTC)"),
+        _ => None,
     }
 }
+
+// Mask the RPC URL to hide the API key in logs
+fn mask_rpc_url(url: &str) -> String {
+    if url.len() <= 25 + 4 {
+        // If the URL is short, just show the beginning
+        format!("{}****", &url[..url.len().min(25)])
+    } else {
+        // Keep first ~25 chars (domain), replace middle with ****, keep last 4 chars
+        let prefix = &url[..25];
+        let suffix = &url[url.len() - 4..];
+        format!("{}****{}", prefix, suffix)
+    }
+}
+
+
+
+
+
+
 
 fn print_verdict(
     verdict_type: &str,
@@ -110,7 +133,9 @@ fn print_verdict(
     buy_tax: f64,
     sell_tax: f64,
     used_brute_force: bool,
-    is_tradable: bool
+    is_tradable: bool,
+    is_limited: bool,
+    gas_estimate: U256
 ) {
     println!("\n{}", "═".repeat(70));
     println!("{}", " FINAL VERDICT ".bright_cyan().bold().on_black());
@@ -142,12 +167,12 @@ fn print_verdict(
     println!("TAX ANALYSIS:");
     println!("├─ Buy Tax:   {:>8.2}%", buy_tax);
     println!("├─ Sell Tax:  {:>8.2}%", sell_tax);
-    println!("├─ Method:    {}", if used_brute_force { 
+    println!("├─ Method:    {}", if used_brute_force {
         "Safe Bombing Fallback (Proxy-Safe)".yellow()
     } else {
         "Standard State Override".green()
     });
-    
+
     let special_status = if buy_tax.abs() > 50.0 || sell_tax.abs() > 50.0 {
         "HIGH TAX ALERT!".red().bold().to_string()
     } else if sell_tax < 0.0 {
@@ -156,7 +181,21 @@ fn print_verdict(
         "Normal tax range".green().to_string()
     };
     println!("└─ Special:   {}", special_status);
-    
+
+    println!("\n{}", "─".repeat(70));
+    println!("GAS ANALYSIS:");
+    let gas_u128 = gas_estimate.as_u128();
+    println!("├─ Estimated Gas: {:>8}", gas_u128);
+
+    let gas_status = if gas_u128 > 1_000_000 {
+        "[WARNING] High Gas Usage - Potential Griefing!".red().bold().to_string()
+    } else if gas_u128 > 400_000 {
+        "[WARNING] Suspicious Gas Usage".yellow().to_string()
+    } else {
+        "Normal Gas Usage".green().to_string()
+    };
+    println!("└─ Status:       {}", gas_status);
+
     println!("{}", "═".repeat(70));
     
     // Additional risk warnings
@@ -171,11 +210,15 @@ fn print_verdict(
     if sell_tax < -5.0 {
         println!("{}", "⚠️  NOTICE: Negative sell tax may indicate special token mechanics (rebase, staking, etc.)".cyan());
     }
-    
+
+    if is_limited {
+        println!("{}", "⚠️  WARNING: Anti-whale mechanics detected - token limits large sells".yellow());
+    }
+
     println!("\n");
 }
 
-fn decode_sell_result(result: &serde_json::Value) -> Result<U256, Box<dyn std::error::Error>> {
+fn decode_sell_result(result: &serde_json::Value) -> Result<U256> {
     if let Some(result_str) = result.as_str() {
         if let Some(stripped) = result_str.strip_prefix("0x") {
             if let Ok(bytes) = hex::decode(stripped) {
@@ -214,19 +257,19 @@ fn decode_sell_result(result: &serde_json::Value) -> Result<U256, Box<dyn std::e
 #[command(about = "Advanced honeypot detection using state overrides")]
 struct Args {
     /// The token address to check for honeypot
-    #[arg(short, long)]
+    #[arg(short = 't', long)]
     token_address: String,
 
     /// RPC endpoint URL (e.g., Alchemy)
-    #[arg(short, long, default_value = "https://eth-mainnet.alchemyapi.io/v2/YOUR_API_KEY")]
-    rpc_url: String,
+    #[arg(short = 'r', long)]
+    rpc_url: Option<String>,
 
     /// Amount of WETH to use for buying (in ETH units, default: 0.01)
     #[arg(long, default_value = "0.01")]
     eth_amount: f64,
 
     /// Target chain ID (1 for Ethereum, 42161 for Arbitrum, 8453 for Base)
-    #[arg(long, default_value = "1")]
+    #[arg(short = 'c', long, default_value = "1")]
     chain_id: u64,
 }
 
@@ -372,13 +415,13 @@ async fn find_allowance_slot(
     owner_addr: H160,
     spender_addr: H160,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    println!("{}", "[*] Finding allowance slot...".cyan());
+    println!("{}", "[*] Finding allowance slot (sequential)...".cyan());
 
     let token_contract: BaseContract = ethers::abi::Contract::load(ERC20_ABI.as_bytes())
         .unwrap()
         .into();
 
-    // Try slots 0 to 20 using state override method (more reliable)
+    // Check slots 0-19 sequentially
     for slot in 0..20 {
         let mut state_override = StateOverride::new();
         let mut account_override = AccountOverride::new();
@@ -452,9 +495,8 @@ async fn find_allowance_slot(
         }
     }
 
-
-    println!("{}", "[!] Could not find allowance slot - using slot 10 as fallback".yellow());
-    Ok(10) // USDC uses slot 10 for allowances
+    println!("[!] Could not find allowance slot");
+    Err("Allowance slot detection failed".into())
 }
 
 
@@ -463,14 +505,13 @@ async fn find_balance_slot(
     token_addr: H160,
     user_addr: H160,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    println!("[*] Finding balance storage slot...");
+    println!("[*] Finding balance storage slot (sequential)...");
 
     let token_contract: BaseContract = ethers::abi::Contract::load(ERC20_ABI.as_bytes())
         .unwrap()
         .into();
 
-
-    // Try slots 0 to 20 using state override method (more reliable)
+    // Check slots 0-19 sequentially
     for slot in 0..20 {
         // Create a state override to set a test value
         let mut state_override = StateOverride::new();
@@ -490,7 +531,10 @@ async fn find_balance_slot(
         state_override.insert(token_addr, account_override);
 
         // Test if balanceOf returns our test value
-        let data = token_contract.encode("balanceOf", (user_addr,))?;
+        let data = match token_contract.encode("balanceOf", (user_addr,)) {
+            Ok(d) => d,
+            Err(_e) => continue,
+        };
         let tx = TransactionRequest::new()
             .from(user_addr)
             .to(token_addr)
@@ -528,7 +572,6 @@ async fn find_balance_slot(
     let current_balance_bytes = provider.call(&tx.into(), None).await?;
     let current_balance = U256::from_big_endian(&current_balance_bytes);
 
-
     // Try storage slots from 0 to 20
     for slot in 0..20 {
         // Calculate the storage key for balanceOf[user_addr] in the mapping
@@ -541,7 +584,6 @@ async fn find_balance_slot(
             None
         ).await?;
 
-
         // Check if this slot contains the user's balance
         // We're looking for a slot where the value matches the user's balance
         if U256::from_big_endian(&storage_value.0) == current_balance {
@@ -550,9 +592,8 @@ async fn find_balance_slot(
         }
     }
 
-
-    println!("[!] Could not find balance slot - using slot 0 as fallback");
-    Ok(0) // Fallback to slot 0
+    println!("[!] Could not find balance slot");
+    Err("Balance slot detection failed".into())
 }
 
 
@@ -562,7 +603,7 @@ async fn simulate_buy(
     weth_addr: H160,
     token_addr: H160,
     eth_amount: U256,
-) -> Result<U256, Box<dyn std::error::Error>> {
+) -> Result<U256> {
     println!("[*] Simulating token purchase...");
     
     let router_contract: BaseContract = ethers::abi::Contract::load(UNISWAP_V2_ROUTER_ABI.as_bytes())
@@ -645,151 +686,176 @@ async fn simulate_sell_with_override(
     balance_slot: u64,
     allowance_slot: u64,
     user_addr: H160,
-) -> Result<(U256, bool), Box<dyn std::error::Error>> {
+) -> Result<(U256, bool, bool, U256)> {
     println!("[*] Simulating token sale with Safe Dynamic Bombing...");
-    println!("balance_slot: {}", balance_slot);
-    println!("allowance_slot: {}", allowance_slot);
+
+    // --- SANITY CHECK: Verify Balance Injection ---
+    // Precisamos ter certeza que o RPC aceitou nosso hack antes de vender.
+    let balance_key = calculate_balance_storage_key(user_addr, balance_slot);
+    let mut check_override = StateOverride::new();
+    let mut check_acc = AccountOverride::new();
+    let mut check_map = HashMap::new();
+    let max_buffer = [0xffu8; 32];
+
+    // Injeta MAX_UINT
+    check_map.insert(format!("0x{:064x}", balance_key), format!("0x{:064x}", H256::from_slice(&max_buffer)));
+    check_acc.state_diff = Some(check_map);
+    check_override.insert(token_addr, check_acc);
+
+    // Faz uma chamada falsa de balanceOf para ver se mudou
+    let token_contract_check: BaseContract = ethers::abi::Contract::load(ERC20_ABI.as_bytes()).unwrap().into();
+    let data_check = token_contract_check.encode("balanceOf", (user_addr,))?;
+    let tx_check = TransactionRequest::new().to(token_addr).data(data_check);
+    let params_check = serde_json::json!([tx_check, "latest", check_override]);
+
+    let balance_verified = match provider.request::<serde_json::Value, serde_json::Value>("eth_call", params_check).await {
+        Ok(res) => {
+            let val = decode_sell_result(&res).unwrap_or(U256::zero());
+            println!("[*] Pre-flight Check: Injected Balance = {}", val);
+            val > U256::zero()
+        },
+        Err(_) => false
+    };
+
+    if !balance_verified {
+        println!("[!] WARNING: Balance override failed. RPC might be ignoring stateDiff.");
+    }
+    // ----------------------------------------------
 
     let router_contract: BaseContract = ethers::abi::Contract::load(UNISWAP_V2_ROUTER_ABI.as_bytes())
         .unwrap()
         .into();
 
-    let path = vec![token_addr, weth_addr];
-    let to = "0x000000000000000000000000000000000000dEaD".parse::<H160>()?; // Dead address instead of zero
+    let to = "0x000000000000000000000000000000000000dEaD".parse::<H160>()?; // Dead address
     let deadline = U256::max_value();
 
-    let data = router_contract
-        .encode("swapExactTokensForETH", (token_amount, U256::zero(), path, to, deadline))?;
+    // Anti-whale fallback loop
+    let sell_amounts = [
+        (token_amount, "100%"),
+        (token_amount / 10, "10%"),
+        (token_amount / 100, "1%"),
+    ];
 
-    // Create state override to set user's token balance AND allowance using Safe Dynamic Bombing
-    let mut state_override = StateOverride::new();
-    let mut account_override = AccountOverride::new();
-    let mut storage_map = HashMap::new();
+    // PRIMARY ATTEMPT: Use ONLY the detected balance_slot and allowance_slot
+    println!("[*] Primary Attempt: Using only detected slots (balance: {}, allowance: {})", balance_slot, allowance_slot);
 
-    let max_buffer = [0xffu8; 32]; // 0xFF...FF (U256::MAX)
+    for (sell_amount, percentage) in sell_amounts.iter() {
+        println!("[*] Testing sell with {} of tokens (specific slots only)...", percentage);
 
-    println!("[*] Injection Mode: SAFE DYNAMIC BOMBING (Slots 0-50 with proxy protection)");
+        let path = vec![token_addr, weth_addr];
+        let data = router_contract
+            .encode("swapExactTokensForETH", (*sell_amount, U256::zero(), path, to, deadline))?;
 
-    // Safe Dynamic Bombing: Loop from 0 to 50, skip proxy-critical slots 0,1,2 unless they are detected slots
-    for i in 0..=50 {
-        // Safety check: Skip slots 0, 1, 2 to protect proxy state (implementation, owner, paused)
-        if i <= 2 && i != balance_slot && i != allowance_slot {
-            continue;
+        // Build StateOverride with ONLY the detected slots
+        let mut state_override = StateOverride::new();
+        let mut account_override = AccountOverride::new();
+        let mut storage_map = HashMap::new();
+
+        // Inject MAX_UINT into ONLY the detected balance slot
+        let balance_key = calculate_balance_storage_key(user_addr, balance_slot);
+        storage_map.insert(format!("0x{:064x}", balance_key), format!("0x{:064x}", H256::from_slice(&max_buffer)));
+
+        // Inject MAX_UINT into ONLY the detected allowance slot
+        let allowance_key = calculate_allowance_storage_key(user_addr, router_addr, allowance_slot);
+        storage_map.insert(format!("0x{:064x}", allowance_key), format!("0x{:064x}", H256::from_slice(&max_buffer)));
+
+        account_override.state_diff = Some(storage_map);
+        state_override.insert(token_addr, account_override);
+
+        let tx = TransactionRequest::new().from(user_addr).to(router_addr).data(data);
+        let params = serde_json::json!([tx, "latest", state_override]);
+
+        // Perform parallel requests for eth_call and eth_estimateGas
+        let call_future = provider.request::<serde_json::Value, serde_json::Value>("eth_call", params.clone());
+        let gas_future = provider.request::<serde_json::Value, U256>("eth_estimateGas", params.clone());
+
+        let (call_result, gas_result) = tokio::join!(call_future, gas_future);
+
+        match call_result {
+            Ok(result) => {
+                let amount = decode_sell_result(&result)?;
+                if amount > U256::zero() {
+                    let is_limited = *percentage != "100%";
+                    println!("[+] {} sell successful: {} WETH (specific slots)", percentage, amount);
+
+                    // Get gas estimate from parallel request
+                    let gas_estimate = gas_result.unwrap_or(U256::zero());
+
+                    return Ok((amount, false, is_limited, gas_estimate));
+                } else {
+                    println!("[!] {} sell returned zero amount", percentage);
+                }
+            },
+            Err(e) => {
+                println!("[!] {} sell failed with specific slots: {:?}", percentage, e);
+            }
         }
-
-        // Write U256::MAX to balance slots
-        let balance_storage_key = calculate_balance_storage_key(user_addr, i);
-        storage_map.insert(
-            format!("0x{:064x}", balance_storage_key),
-            format!("0x{:064x}", H256::from_slice(&max_buffer))
-        );
-
-        // Write U256::MAX to allowance slots
-        let allowance_storage_key = calculate_allowance_storage_key(user_addr, router_addr, i);
-        storage_map.insert(
-            format!("0x{:064x}", allowance_storage_key),
-            format!("0x{:064x}", H256::from_slice(&max_buffer))
-        );
     }
 
-    account_override.state_diff = Some(storage_map);
-    state_override.insert(token_addr, account_override);
+    // FALLBACK ATTEMPT: Safe Dynamic Bombing (ONLY if all specific slot attempts failed)
+    println!("[*] All specific slot attempts failed, trying Safe Dynamic Bombing fallback...");
+    println!("[*] Safe Bombing: Injecting MAX_UINT into balance and allowance slots 3-50");
+    println!("[*] Safe Bombing: Skipping proxy-critical slots 0, 1, 2 to avoid breaking Proxy implementation");
 
-
-    println!("[*] Safe Dynamic Bombing applied. Attempting direct sale...");
+    // Try with 1% amount for the fallback
+    let fallback_sell_amount = token_amount / 100;
+    let path = vec![token_addr, weth_addr];
+    let data = router_contract
+        .encode("swapExactTokensForETH", (fallback_sell_amount, U256::zero(), path, to, deadline))?;
 
     let tx = TransactionRequest::new()
         .from(user_addr)
         .to(router_addr)
         .data(data);
 
-    // Using the JSON-RPC method for eth_call with state override
-    let params = serde_json::json!([tx, "latest", state_override]);
+    // Fallback: Create new StateOverride with MAX_UINT in ALL slots from 3 to 50
+    let mut fallback_state_override = StateOverride::new();
+    let mut fallback_account_override = AccountOverride::new();
+    let mut fallback_storage_map = HashMap::new();
 
-    match provider.request::<serde_json::Value, serde_json::Value>("eth_call", params).await {
-        Ok(result) => {
-            let amount = decode_sell_result(&result)?;
-            return Ok((amount, false));
-        },
-        Err(e) => {
-            let error_msg = format!("{}", e);
-            // Extract revert reason from error message
-            let revert_msg = if error_msg.contains("execution reverted:") {
-                let parts: Vec<&str> = error_msg.split("execution reverted:").collect();
-                if parts.len() > 1 {
-                    parts[1].trim().to_string()
-                } else {
-                    "Unknown revert reason".to_string()
-                }
+    for i in 3..=50 {
+        // Inject MAX_UINT into balance slots
+        let balance_storage_key = calculate_balance_storage_key(user_addr, i);
+        fallback_storage_map.insert(
+            format!("0x{:064x}", balance_storage_key),
+            format!("0x{:064x}", H256::from_slice(&max_buffer))
+        );
+
+        // Inject MAX_UINT into allowance slots
+        let allowance_storage_key = calculate_allowance_storage_key(user_addr, router_addr, i);
+        fallback_storage_map.insert(
+            format!("0x{:064x}", allowance_storage_key),
+            format!("0x{:064x}", H256::from_slice(&max_buffer))
+        );
+    }
+
+    fallback_account_override.state_diff = Some(fallback_storage_map);
+    fallback_state_override.insert(token_addr, fallback_account_override);
+
+    let fallback_params = serde_json::json!([tx, "latest", fallback_state_override]);
+
+    match provider.request::<serde_json::Value, serde_json::Value>("eth_call", fallback_params).await {
+        Ok(fallback_result) => {
+            let amount = decode_sell_result(&fallback_result)?;
+            if amount > U256::zero() {
+                println!("[+] Safe Bombing fallback successful! Token is tradable via brute force.");
+
+                // Perform gas estimation for fallback case
+                let fallback_gas_estimate_params = serde_json::json!([tx, "latest", fallback_state_override]);
+                let gas_estimate = match provider.request::<serde_json::Value, U256>("eth_estimateGas", fallback_gas_estimate_params).await {
+                    Ok(gas) => gas,
+                    Err(_) => U256::zero(), // Fallback if estimation fails
+                };
+
+                return Ok((amount, true, false, gas_estimate));
             } else {
-                "Execution reverted without message".to_string()
-            };
-
-
-            println!("[!] Specific slot override failed: {}", parse_error(&revert_msg));
-            println!("[*] Attempting Safe Bombing fallback (Proxy-safe injection into slots 3-50)...");
-
-            // Fallback: Create new StateOverride with MAX_UINT in ALL slots from 3 to 50
-            // This is SAFE for Proxy contracts as it skips slots 0, 1, 2 which contain:
-            // slot 0: implementation address
-            // slot 1: admin address  
-            // slot 2: reserved for future use
-            let mut fallback_state_override = StateOverride::new();
-            let mut fallback_account_override = AccountOverride::new();
-            let mut fallback_storage_map = HashMap::new();
-
-            println!("[*] Safe Bombing: Injecting MAX_UINT into balance and allowance slots 3-50");
-            println!("[*] Safe Bombing: Skipping proxy-critical slots 0, 1, 2 to avoid breaking Proxy implementation");
-
-            for i in 3..=50 {
-                // Inject MAX_UINT into balance slots
-                let balance_storage_key = calculate_balance_storage_key(user_addr, i);
-                fallback_storage_map.insert(
-                    format!("0x{:064x}", balance_storage_key),
-                    format!("0x{:064x}", H256::from_slice(&max_buffer))
-                );
-
-                // Inject MAX_UINT into allowance slots
-                let allowance_storage_key = calculate_allowance_storage_key(user_addr, router_addr, i);
-                fallback_storage_map.insert(
-                    format!("0x{:064x}", allowance_storage_key),
-                    format!("0x{:064x}", H256::from_slice(&max_buffer))
-                );
+                eprintln!("[-] Safe Bombing fallback returned zero amount");
+                return Err(anyhow::anyhow!("All sell attempts failed including Safe Bombing fallback"));
             }
-
-            fallback_account_override.state_diff = Some(fallback_storage_map);
-            fallback_state_override.insert(token_addr, fallback_account_override);
-
-            let fallback_params = serde_json::json!([tx, "latest", fallback_state_override]);
-
-            match provider.request::<serde_json::Value, serde_json::Value>("eth_call", fallback_params).await {
-                Ok(fallback_result) => {
-                    let amount = decode_sell_result(&fallback_result)?;
-                    if amount > U256::zero() {
-                        println!("[+] Safe Bombing fallback successful! Token is tradable via brute force.");
-                        return Ok((amount, true));
-                    } else {
-                        eprintln!("[-] Safe Bombing fallback returned zero amount");
-                        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, parse_error(&revert_msg))));
-                    }
-                },
-                Err(fallback_e) => {
-                    let fallback_error_msg = format!("{}", fallback_e);
-                    let fallback_revert_msg = if fallback_error_msg.contains("execution reverted:") {
-                        let parts: Vec<&str> = fallback_error_msg.split("execution reverted:").collect();
-                        if parts.len() > 1 {
-                            parts[1].trim().to_string()
-                        } else {
-                            "Unknown revert reason".to_string()
-                        }
-                    } else {
-                        "Execution reverted without message".to_string()
-                    };
-
-                    eprintln!("[-] Safe Bombing fallback also failed: {}", parse_error(&fallback_revert_msg));
-                    Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, parse_error(&revert_msg))))
-                }
-            }
+        },
+        Err(fallback_e) => {
+            eprintln!("[-] Safe Bombing fallback also failed: {:?}", fallback_e);
+            Err(anyhow::anyhow!("All sell attempts failed including Safe Bombing fallback"))
         }
     }
 }
@@ -892,9 +958,11 @@ async fn get_token_info(
 
 
 async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc_url = args.rpc_url.as_ref().ok_or("RPC_URL not provided via CLI or .env file")?;
+
     println!("[*] Starting VERDICT Analysis for Honeypot Detection");
     println!("[*] Target:      {}", args.token_address);
-    println!("[*] RPC:         {}", args.rpc_url);
+    println!("[*] RPC:         {}", mask_rpc_url(rpc_url));
     println!();
 
     // Parse inputs
@@ -902,7 +970,26 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let eth_amount = parse_ether(args.eth_amount)?
         .try_into()
         .map_err(|_| "Failed to convert ETH amount")?;
-    
+
+    // Check for verified assets (Fast Pass Whitelist)
+    if let Some(token_name) = get_verified_asset_info(token_addr, args.chain_id) {
+        println!("{}", format!("[+] KNOWN VERIFIED ASSET DETECTED: {}", token_name).green().bold());
+        println!("{}", "[+] STATUS: TRUSTED (Skipping Simulation to avoid False Positives)".green());
+
+        // Call existing print_verdict with safe defaults
+        print_verdict(
+            "[SAFE] VERIFIED ASSET",
+            "Official Verified Bluechip (Whitelisted)",
+            0.0, // Buy Tax
+            0.0, // Sell Tax
+            false, // Brute force
+            true, // Tradable
+            false, // Limited
+            U256::zero() // Gas estimate (irrelevant)
+        );
+        return Ok(());
+    }
+
     // Use the appropriate router and WETH based on chain ID
     let (router_addr, weth_addr) = match args.chain_id {
         1 => (  // Ethereum
@@ -928,7 +1015,7 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Connect to RPC
-    let provider = Provider::<Http>::try_from(&args.rpc_url)?;
+    let provider = Provider::<Http>::try_from(rpc_url)?;
     
 
     // Get token info
@@ -965,38 +1052,37 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let fake_user = H160::from_str("0x1111111111111111111111111111111111111111").unwrap(); // Fixed fake user address
 
     // Always perform dynamic slot detection (no caching)
-    let detected_balance_slot = match timeout(Duration::from_secs(30), find_balance_slot(&provider, token_addr, fake_user)).await {
-        Ok(Ok(slot)) => slot,
+    let balance_slot = match timeout(Duration::from_secs(30), find_balance_slot(&provider, token_addr, fake_user)).await {
+        Ok(Ok(slot)) => {
+            println!("[+] Detected balance slot: {}", slot);
+            slot
+        },
         Ok(Err(e)) => {
-            warn!("Balance slot detection failed: {}", e);
-            println!("[!] Slot detection timed out - using fallback");
-            0
+            error!("Balance slot detection failed: {}", e);
+            println!("[-] Balance slot detection failed, cannot proceed with analysis");
+            return Ok(());
         },
         Err(_) => {
-            println!("[!] Slot detection timed out - using fallback");
-            0
+            println!("[-] Balance slot detection timed out, cannot proceed with analysis");
+            return Ok(());
         }
     };
 
-    let detected_allowance_slot = match timeout(Duration::from_secs(30), find_allowance_slot(&provider, token_addr, fake_user, router_addr)).await {
-        Ok(Ok(slot)) => slot,
+    let allowance_slot = match timeout(Duration::from_secs(30), find_allowance_slot(&provider, token_addr, fake_user, router_addr)).await {
+        Ok(Ok(slot)) => {
+            println!("[+] Detected allowance slot: {}", slot);
+            slot
+        },
         Ok(Err(e)) => {
-            warn!("Allowance slot detection failed: {}", e);
-            println!("[!] Slot detection timed out - using fallback");
-            10  // Default for allowances
+            error!("Allowance slot detection failed: {}", e);
+            println!("[-] Allowance slot detection failed, cannot proceed with analysis");
+            return Ok(());
         },
         Err(_) => {
-            println!("[!] Slot detection timed out - using fallback");
-            10
+            println!("[-] Allowance slot detection timed out, cannot proceed with analysis");
+            return Ok(());
         }
     };
-
-    // Trust the finder directly - no verification needed
-    let balance_slot = detected_balance_slot;
-    let allowance_slot = detected_allowance_slot;
-
-    println!("[+] Using balance slot: {}", balance_slot);
-    println!("[+] Using allowance slot: {}", allowance_slot);
 
     // Check if this is a special token that might behave differently
     let is_special = is_special_token(token_addr);
@@ -1006,26 +1092,28 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 
     // Step 3: Sell simulation with state override
-    let (eth_returned, used_brute_force) = match simulate_sell_with_override(&provider, router_addr, weth_addr, token_addr, tokens_received, balance_slot, allowance_slot, fake_user).await {
-        Ok((amount, brute_force)) => {
+    let sell_result = match simulate_sell_with_override(&provider, router_addr, weth_addr, token_addr, tokens_received, balance_slot, allowance_slot, fake_user).await {
+        Ok((amount, brute_force, limited, gas)) => {
             info!("Sale simulation successful, returned: {}", amount);
-            (amount, brute_force)
+            Some((amount, brute_force, limited, gas))
         },
         Err(e) => {
             // Error parsing is now handled in simulate_sell_with_override
             eprintln!("[-] Sale simulation failed: {}", e);
 
-            // For special tokens, don't immediately flag as honeypot - they might just have different mechanics
+            // For special tokens, log the warning but still flag as honeypot if sell fails
             if is_special {
-                println!("[!] SPECIAL TOKEN: Sale failed but may be due to token mechanics, not honeypot");
-                return Ok(());
+                println!("[!] SPECIAL TOKEN: Sale failed - may be due to token mechanics, but flagged as honeypot for safety");
             }
 
-            // For the current implementation, we'll still flag it as honeypot for standard tokens
-            // In a production version, we'd want more sophisticated error handling
             println!("[-] HONEYPOT DETECTED - Cannot sell tokens");
             return Ok(());
         }
+    };
+
+    let (eth_returned, used_brute_force, is_limited, gas_estimate) = match sell_result {
+        Some((amount, brute_force, limited, gas)) => (amount, brute_force, limited, gas),
+        None => (U256::zero(), false, false, U256::zero()),
     };
     
     println!("[+] Sell Success: {} WETH", eth_returned);
@@ -1132,7 +1220,9 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             buy_tax,
             sell_tax,
             used_brute_force,
-            false
+            false,
+            false,
+            gas_estimate
         );
     } else if is_significantly_negative {
         // Special handling for tokens with significant negative sell tax
@@ -1143,7 +1233,9 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             buy_tax,
             sell_tax,
             used_brute_force,
-            false
+            false,
+            false,
+            gas_estimate
         );
     } else if sell_tax > 50.0 {
         warn!("High sell tax detected: {:.2}%", sell_tax);
@@ -1153,7 +1245,9 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             buy_tax,
             sell_tax,
             used_brute_force,
-            false
+            false,
+            false,
+            gas_estimate
         );
     } else {
         info!("Token is tradable with reasonable taxes");
@@ -1179,7 +1273,9 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             buy_tax,
             sell_tax,
             used_brute_force,
-            true
+            true,
+            is_limited,
+            gas_estimate
         );
     }
     
@@ -1189,10 +1285,18 @@ async fn run_simulation(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file
+    dotenv().ok();
+
     // Initialize logger
     tracing_subscriber::fmt::init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Load RPC_URL from .env if not provided via CLI
+    if args.rpc_url.is_none() {
+        args.rpc_url = std::env::var("RPC_URL").ok();
+    }
 
     // Clear screen (optional but nice)
     print!("\x1B[2J\x1B[1;1H");
@@ -1206,8 +1310,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                       \/                \/              \/
     "#.bright_cyan().bold());
 
-    println!("{}", "    :: RUST EVM HONEYPOT DETECTOR :: v0.3.0 ::".white().dimmed());
-    println!("{}", "    :: STATE OVERRIDE ENGINE ACTIVE ::".red().dimmed());
+    println!("{}", "VERDICT v1.0.0 - Community Edition".white().bold());
+    println!("{}", "Advanced EVM Honeypot Detector in Rust".cyan());
+    println!("{}", "Zero-cost state overrides + Safe Dynamic Bombing™".dimmed());
+    println!("{}", "Detects honeypots, anti-whale, unbuyable tokens with real simulation.".dimmed());
+    println!("{}", ">> Developed by Manuel Guilherme 🦀 | https://www.linkedin.com/in/galmanus/ <<".yellow().bold());
     println!();
 
     info!("Starting VERDICT analysis for token: {}", args.token_address);
