@@ -39,7 +39,7 @@ Advanced **Safe Dynamic Bombing™** technique that preserves Proxy contract int
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/verdict.git
+git clone https://github.com/Galmanus/verdict-evm.git
 cd verdict
 
 # 2. Install with Cargo
