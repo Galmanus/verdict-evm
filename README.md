@@ -224,7 +224,7 @@ GAS ANALYSIS:
 
 ```bash
 # Clone repository
-git clone https://github.com/your-username/verdict.git
+git clone https://github.com/Galmanus/verdict-evm.git
 cd verdict
 
 # Build release version
